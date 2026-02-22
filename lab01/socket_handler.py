@@ -32,7 +32,65 @@ def set_keepalive(sock, idle=30, interval=5, count=3):
 
 
 def recv_exact(sock, num_bytes):
-    """Получение точного количества байт из сокета"""
+    """Получение точного количества байт с большим буфером"""
+    if num_bytes <= 0:
+        return b''
+
+    # Для больших файлов используем буфер побольше
+    buffer_size = min(num_bytes, 65536)  # 64 KB максимум
+
+    data = b''
+    while len(data) < num_bytes:
+        try:
+            chunk = sock.recv(min(buffer_size, num_bytes - len(data)))
+            if not chunk:
+                raise ConnectionError("Соединение разорвано при получении данных")
+            data += chunk
+
+            # Динамически увеличиваем буфер если всё хорошо
+            if buffer_size < 65536 and len(data) > buffer_size * 10:
+                buffer_size = min(buffer_size * 2, 65536)
+
+        except socket.timeout:
+            # При таймауте просто продолжаем
+            continue
+        except socket.error as e:
+            raise ConnectionError(f"Ошибка сокета: {e}")
+
+    return data
+
+
+def recv_until(sock, delimiter='\n'):
+    """
+    Получение ТЕКСТОВЫХ данных до разделителя
+    Использовать ТОЛЬКО для команд!
+    """
+    if isinstance(delimiter, str):
+        delimiter = delimiter.encode()
+
+    data = b''
+    while True:
+        try:
+            chunk = sock.recv(1)
+            if not chunk:
+                raise ConnectionError("Соединение разорвано")
+
+            data += chunk
+
+            if data.endswith(delimiter) or data.endswith(b'\r\n'):
+                break
+        except socket.timeout:
+            continue
+
+    # Декодируем ТОЛЬКО в конце, когда точно знаем, что это текст
+    return data.decode('utf-8').strip()
+
+
+def recv_exact(sock, num_bytes):
+    """
+    Получение точного количества БАЙТ (для файлов)
+    НИКАКОГО декодирования!
+    """
     if num_bytes <= 0:
         return b''
 
@@ -45,42 +103,8 @@ def recv_exact(sock, num_bytes):
             data += chunk
         except socket.timeout:
             continue
-        except socket.error as e:
-            raise ConnectionError(f"Ошибка сокета: {e}")
 
-    return data
-
-
-def recv_until(sock, delimiter=CMD_TERMINATOR):
-    """Получение данных до указанного разделителя"""
-    if isinstance(delimiter, str):
-        delimiter = delimiter.encode()
-
-    data = b''
-    delimiter_len = len(delimiter)
-
-    while True:
-        try:
-            chunk = sock.recv(1)
-            if not chunk:
-                raise ConnectionError("Соединение разорвано")
-
-            data += chunk
-
-            if len(data) >= delimiter_len:
-                if data[-delimiter_len:] == delimiter:
-                    break
-                if delimiter == b'\n' and data.endswith(b'\r\n'):
-                    break
-        except socket.timeout:
-            continue
-        except socket.error as e:
-            raise ConnectionError(f"Ошибка сокета: {e}")
-
-    if data.endswith(b'\r\n'):
-        return data[:-2].decode('utf-8')
-    else:
-        return data[:-delimiter_len].decode('utf-8')
+    return data  # ← возвращаем БАЙТЫ, не строку!
 
 
 def send_all(sock, data):

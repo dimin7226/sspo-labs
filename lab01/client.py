@@ -25,6 +25,7 @@ class TCPClient:
         self.client_id = client_id
         self.socket = None
         self.connected = False
+        self.current_transfer = None
 
         ensure_dirs()
 
@@ -52,6 +53,22 @@ class TCPClient:
             if response == "OK":
                 self.connected = True
                 print(f"✓ Подключено к серверу {self.server_host}:{self.server_port}")
+
+                if self.current_transfer:
+                    print(f"\n↻ Обнаружена прерванная передача")
+                    print(f"   Файл: {self.current_transfer['filename']}")
+                    print(f"   Прогресс: {self.current_transfer['offset']}/{self.current_transfer['filesize']} байт")
+
+                    resume = input("Продолжить передачу? (y/n): ").lower()
+                    if resume == 'y':
+                        if self.current_transfer['type'] == 'upload':
+                            self.upload_file(self.current_transfer['filename'])
+                        else:
+                            self.download_file(self.current_transfer['filename'])
+                    else:
+                        # Очищаем информацию о передаче
+                        self.current_transfer = None
+
                 return True
             else:
                 print(f"✗ Ошибка: {response}")
@@ -168,14 +185,13 @@ class TCPClient:
             print(f"\n✗ Ошибка при загрузке: {e}")
 
     def download_file(self, filename):
-        """Скачивание файла с сервера"""
+        """Скачивание файла с сервера с поддержкой больших файлов"""
         basename = os.path.basename(filename)
 
         print(f"\nСкачивание файла '{basename}'...")
 
         # Отправляем команду
-        cmd = f"DOWNLOAD {basename}\n"
-        send_all(self.socket, cmd)
+        send_all(self.socket, f"DOWNLOAD {basename}\n")
 
         # Получаем размер файла
         response = recv_until(self.socket)
@@ -185,56 +201,100 @@ class TCPClient:
 
         if response.startswith("FILESIZE "):
             filesize = int(response[9:])
-            print(f"Размер файла: {filesize} байт")
+            print(f"Размер файла: {filesize} байт ({filesize / 1024 / 1024:.2f} МБ)")
         else:
             print(f"✗ Неожиданный ответ: {response}")
             return
 
-        # Проверяем частичную загрузку
+        # Проверяем, есть ли уже частично скачанный файл
         offset = 0
         if os.path.exists(basename):
             existing = get_file_size(basename)
             if existing < filesize:
-                print(f"↻ Найден частичный файл, продолжаем с {existing} байт")
+                print(f"↻ Найден частичный файл: {existing} байт ({existing / 1024 / 1024:.2f} МБ)")
                 offset = existing
                 send_all(self.socket, f"{offset}\n")
             elif existing == filesize:
                 print("✓ Файл уже полностью скачан")
                 return
-            else:
-                # Файл больше, чем на сервере - перезаписываем
-                offset = 0
-                send_all(self.socket, "0\n")
         else:
             send_all(self.socket, "0\n")
+
+        # Сохраняем информацию о текущей передаче
+        self.current_transfer = {
+            'type': 'download',
+            'filename': basename,
+            'filesize': filesize,
+            'offset': offset
+        }
 
         stats = FileTransferStats()
         stats.start()
 
         try:
             mode = 'ab' if offset > 0 else 'wb'
+            # Используем большой буфер для скорости
+            buffer_size = BUFFER_SIZE * 4  # 32 КБ вместо 8 КБ
+
             with open(basename, mode) as f:
                 if mode == 'ab':
                     f.seek(offset)
 
                 received = offset
+                last_update = time.time()
+                last_received = received
+
                 while received < filesize:
-                    chunk_size = min(BUFFER_SIZE, filesize - received)
+                    # Проверяем, живо ли соединение
+                    if time.time() - last_update > 30:  # Каждые 30 секунд
+                        try:
+                            # Отправляем keepalive
+                            self.socket.send(b'\x00')
+                        except:
+                            raise ConnectionError("Соединение потеряно")
+
+                    # Читаем порцию данных
+                    chunk_size = min(buffer_size, filesize - received)
                     data = recv_exact(self.socket, chunk_size)
 
                     f.write(data)
                     received += len(data)
                     stats.add_bytes(len(data))
 
-                    percent = (received / filesize) * 100
-                    print(f"\rСкачивание: {percent:.1f}%", end="")
+                    # Обновляем прогресс каждые 0.5 секунды
+                    if time.time() - last_update > 0.5:
+                        percent = (received / filesize) * 100
+                        downloaded_mb = received / 1024 / 1024
+                        total_mb = filesize / 1024 / 1024
+                        speed = (received - last_received) / (time.time() - last_update) / 1024  # КБ/с
 
-            print()
+                        print(
+                            f"\rСкачивание: {percent:.1f}% ({downloaded_mb:.1f}/{total_mb:.1f} МБ) [{speed:.0f} КБ/с]",
+                            end="")
+
+                        last_update = time.time()
+                        last_received = received
+
+                        # Обновляем смещение в текущей передаче
+                        self.current_transfer['offset'] = received
+
+            print()  # Новая строка после прогресса
             stats.stop()
             stats.print_stats("Скачивание файла")
 
+            # Очищаем текущую передачу
+            self.current_transfer = None
+
+        except (ConnectionError, socket.error) as e:
+            print(f"\n⚠ Соединение разорвано во время скачивания")
+            print(f"ℹ Сохранено {received} из {filesize} байт")
+            print(f"ℹ Информация сохранена для восстановления")
+            # Информация о передаче сохраняется в self.current_transfer
+            raise
         except Exception as e:
             print(f"\n✗ Ошибка при скачивании: {e}")
+            self.current_transfer = None
+            raise
 
     def run(self):
         """Основной цикл клиента"""
@@ -265,9 +325,29 @@ class TCPClient:
                 else:
                     print("✗ Сначала выполните CONNECT")
 
+
             except KeyboardInterrupt:
-                print("\nЗавершение работы...")
-                break
+
+                print("\n\n⚠ Получен сигнал прерывания")
+
+                if self.current_transfer:
+                    print(f"ℹ Передача '{self.current_transfer['filename']}' прервана")
+
+                    print(f"ℹ Сохранено {self.current_transfer['offset']} из {self.current_transfer['filesize']} байт")
+
+                    print("ℹ При следующем подключении передача продолжится")
+
+                # Спрашиваем, что делать
+
+                response = input("Завершить программу? (y/n): ").lower()
+
+                if response == 'y':
+
+                    break
+
+                else:
+
+                    continue
             except Exception as e:
                 print(f"✗ Ошибка: {e}")
 

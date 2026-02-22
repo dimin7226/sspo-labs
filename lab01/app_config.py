@@ -19,14 +19,14 @@ UPLOADS_DIR = 'uploads'
 PARTIAL_DIR = 'partial'
 
 # Максимальное время ожидания восстановления соединения (сек)
-MAX_RECOVERY_TIME = 120
+MAX_RECOVERY_TIME = 600
 
 # Определение ОС
 IS_WINDOWS = platform.system() == 'Windows'
 
 # Таймауты (в секундах)
-SOCKET_TIMEOUT = 30
-CONNECTION_TIMEOUT = 10
+SOCKET_TIMEOUT = 300
+CONNECTION_TIMEOUT = 60
 
 # Разделитель команд
 CMD_TERMINATOR = '\n'
