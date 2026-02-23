@@ -11,10 +11,7 @@ import threading
 
 from app_config import *
 from socket_handler import set_keepalive, recv_until, recv_exact, send_all
-from file_handler import (
-    ensure_dirs, get_file_size, get_partial_size,
-    FileTransferStats
-)
+from file_handler import ensure_dirs, get_file_size, get_partial_size, FileTransferStats
 from udp_handler import *
 from sliding_window import SlidingWindow, ReceiveWindow
 
@@ -92,10 +89,10 @@ class TCPClientHandler:
             elif cmd == "ECHO":
                 self._send_simple_command(command)
             elif cmd == "UPLOAD" and len(parts) >= 2:
-                filename = ' '.join(parts[1:])
+                filename = " ".join(parts[1:])
                 self.upload_file(filename)
             elif cmd == "DOWNLOAD" and len(parts) >= 2:
-                filename = ' '.join(parts[1:])
+                filename = " ".join(parts[1:])
                 self.download_file(filename)
             else:
                 print(f"✗ Неизвестная команда: {command}")
@@ -130,7 +127,7 @@ class TCPClientHandler:
         stats.start()
 
         try:
-            with open(filename, 'rb') as f:
+            with open(filename, "rb") as f:
                 sent = 0
                 while sent < filesize:
                     data = f.read(BUFFER_SIZE)
@@ -187,9 +184,9 @@ class TCPClientHandler:
         stats.start()
 
         try:
-            mode = 'ab' if offset > 0 else 'wb'
+            mode = "ab" if offset > 0 else "wb"
             with open(basename, mode) as f:
-                if mode == 'ab':
+                if mode == "ab":
                     f.seek(offset)
 
                 received = offset
@@ -230,20 +227,22 @@ class UDPClientHandler:
         """Подключение к UDP серверу"""
         try:
             self.socket = create_udp_socket()
-            self.socket.settimeout(0.01)
+            self.socket.settimeout(1)
             self.server_addr = (server_host, server_port)
             self.client_id = client_id
 
             print(f"UDP подключение к {server_host}:{server_port}...")
 
-            packet = create_packet(0, 1, FLAG_START | FLAG_END, f"CLIENT {client_id}".encode())
+            packet = create_packet(
+                0, 1, FLAG_START | FLAG_END, f"CLIENT {client_id}".encode()
+            )
             self.socket.sendto(packet, self.server_addr)
 
             for attempt in range(3):
                 try:
                     data, addr = self.socket.recvfrom(65535)
                     result = parse_packet(data)
-                    if result and result[2] & FLAG_ACK and result[3] == b'OK':
+                    if result and result[2] & FLAG_ACK and result[3] == b"OK":
                         self.connected = True
                         print(f"✓ Подключено к UDP серверу {server_host}:{server_port}")
                         return True
@@ -263,7 +262,7 @@ class UDPClientHandler:
         """Отключение от UDP сервера"""
         if self.connected:
             try:
-                packet = create_packet(0, 1, FLAG_END, b'CLOSE')
+                packet = create_packet(0, 1, FLAG_END, b"CLOSE")
                 self.socket.sendto(packet, self.server_addr)
             except:
                 pass
@@ -291,10 +290,10 @@ class UDPClientHandler:
         elif cmd == "ECHO":
             self._send_command_echo(command)
         elif cmd == "UPLOAD" and len(parts) >= 2:
-            filename = ' '.join(parts[1:])
+            filename = " ".join(parts[1:])
             self.upload_file(filename)
         elif cmd == "DOWNLOAD" and len(parts) >= 2:
-            filename = ' '.join(parts[1:])
+            filename = " ".join(parts[1:])
             self.download_file(filename)
         else:
             print(f"✗ Неизвестная команда: {command}")
@@ -313,7 +312,7 @@ class UDPClientHandler:
     def _send_simple_command(self, command):
         """Отправка простой команды и получение ответа"""
         try:
-            data = command.encode('utf-8')
+            data = command.encode("utf-8")
             max_chunk = 1400 - PACKET_HEADER_SIZE
             total_packets = (len(data) + max_chunk - 1) // max_chunk
 
@@ -409,7 +408,7 @@ class UDPClientHandler:
         sent_bytes = 0
         last_update = time.time()
 
-        with open(filename, 'rb') as f:
+        with open(filename, "rb") as f:
             print("Отправка данных...")
 
             while base_seq < next_seq or sent_bytes < filesize:
@@ -425,9 +424,9 @@ class UDPClientHandler:
 
                     packet = create_packet(next_seq, total_packets, flags, chunk)
                     window[next_seq] = {
-                        'packet': packet,
-                        'time': time.time(),
-                        'resends': 0
+                        "packet": packet,
+                        "time": time.time(),
+                        "resends": 0,
                     }
 
                     self.socket.sendto(packet, self.server_addr)
@@ -449,19 +448,25 @@ class UDPClientHandler:
 
                 current_time = time.time()
                 for seq, info in list(window.items()):
-                    if current_time - info['time'] > self.packet_timeout:
-                        if info['resends'] < 3:
-                            self.socket.sendto(info['packet'], self.server_addr)
-                            info['time'] = current_time
-                            info['resends'] += 1
-                            self.stats.add_bytes(len(info['packet']))
+                    if current_time - info["time"] > self.packet_timeout:
+                        if info["resends"] < 3:
+                            self.socket.sendto(info["packet"], self.server_addr)
+                            info["time"] = current_time
+                            info["resends"] += 1
+                            self.stats.add_bytes(len(info["packet"]))
 
                 if current_time - last_update > 0.2:
                     percent = (sent_bytes / filesize) * 100
-                    speed = self.stats.total_bytes * 8 / (current_time - self.stats.start_time) / 1000
+                    speed = (
+                        self.stats.total_bytes
+                        * 8
+                        / (current_time - self.stats.start_time)
+                        / 1000
+                    )
                     print(
                         f"\rЗагрузка: {percent:.1f}% | {self._format_bytes(sent_bytes)}/{self._format_bytes(filesize)} | {speed:.0f} Кбит/с",
-                        end="")
+                        end="",
+                    )
                     last_update = current_time
 
                 time.sleep(0.001)
@@ -517,7 +522,9 @@ class UDPClientHandler:
 
                 # Отправляем ACK пачкой
                 current_time = time.time()
-                if ack_batch and (current_time - last_ack > 0.005 or len(ack_batch) > 50):
+                if ack_batch and (
+                    current_time - last_ack > 0.005 or len(ack_batch) > 50
+                ):
                     for ack_id in ack_batch[:20]:  # Не больше 20 за раз
                         ack = create_ack_packet(ack_id)
                         self.socket.sendto(ack, self.server_addr)
@@ -527,10 +534,16 @@ class UDPClientHandler:
                 # Прогресс
                 if current_time - last_progress > 0.1:
                     percent = (received / filesize) * 100
-                    speed = self.stats.total_bytes * 8 / (current_time - self.stats.start_time) / 1000
+                    speed = (
+                        self.stats.total_bytes
+                        * 8
+                        / (current_time - self.stats.start_time)
+                        / 1000
+                    )
                     print(
                         f"\rСкачивание: {percent:.1f}% | {self._format_bytes(received)}/{self._format_bytes(filesize)} | {speed:.0f} Кбит/с",
-                        end="")
+                        end="",
+                    )
                     last_progress = current_time
 
             except Exception as e:
@@ -543,7 +556,7 @@ class UDPClientHandler:
             # Убираем None из конца
             valid_packets = [p for p in packets if p is not None]
 
-            with open(filepath, 'wb') as f:
+            with open(filepath, "wb") as f:
                 for packet in valid_packets:
                     f.write(packet)
 
@@ -567,7 +580,7 @@ class UDPClientHandler:
     def _wait_for_response(self, timeout=3):
         """Ожидание ответа от сервера"""
         start_time = time.time()
-        data = b''
+        data = b""
         packets = {}
 
         while time.time() - start_time < timeout:
@@ -588,7 +601,7 @@ class UDPClientHandler:
                     for i in range(total):
                         if i in packets:
                             data += packets[i]
-                    return data.decode('utf-8', errors='ignore')
+                    return data.decode("utf-8", errors="ignore")
 
             except socket.timeout:
                 continue
@@ -606,7 +619,7 @@ class UDPClientHandler:
                 counter += 1
             filepath = f"{base}_{counter}{ext}"
 
-        with open(filepath, 'wb') as f:
+        with open(filepath, "wb") as f:
             for pid in sorted(packets.keys()):
                 f.write(packets[pid])
 
@@ -615,7 +628,9 @@ class UDPClientHandler:
             print(f"✓ Файл сохранен: {os.path.basename(filepath)}")
             print(f"  Путь: {os.path.abspath(filepath)}")
         else:
-            print(f"⚠ Файл сохранен, но размер не совпадает: {saved_size} != {expected_size}")
+            print(
+                f"⚠ Файл сохранен, но размер не совпадает: {saved_size} != {expected_size}"
+            )
 
     def _print_stats(self, operation):
         """Вывод статистики"""
@@ -629,7 +644,7 @@ class UDPClientHandler:
 
     def _format_bytes(self, bytes_count):
         """Форматирование размера"""
-        for unit in ['Б', 'КБ', 'МБ', 'ГБ']:
+        for unit in ["Б", "КБ", "МБ", "ГБ"]:
             if bytes_count < 1024.0:
                 return f"{bytes_count:.1f} {unit}"
             bytes_count /= 1024.0
@@ -649,7 +664,7 @@ class Client:
         self.udp = UDPClientHandler(self)
 
         # Текущий протокол
-        self.current_protocol = 'tcp'
+        self.current_protocol = "tcp"
 
         ensure_dirs()
 
@@ -661,7 +676,7 @@ class Client:
     @property
     def current(self):
         """Получение текущего обработчика"""
-        return self.tcp if self.current_protocol == 'tcp' else self.udp
+        return self.tcp if self.current_protocol == "tcp" else self.udp
 
     def run(self):
         """Основной цикл клиента"""
@@ -689,16 +704,18 @@ class Client:
 
                 elif cmd.upper().startswith("PROTOCOL"):
                     parts = cmd.split()
-                    if len(parts) == 2 and parts[1].lower() in ['tcp', 'udp']:
+                    if len(parts) == 2 and parts[1].lower() in ["tcp", "udp"]:
                         self.current_protocol = parts[1].lower()
                         print(f"Протокол изменен на {self.current_protocol.upper()}")
                     else:
                         print("Используйте: PROTOCOL [tcp|udp]")
 
                 elif cmd.upper() == "CONNECT":
-                    client_id = input("Введите ID клиента (по умолчанию 1): ").strip() or "1"
+                    client_id = (
+                        input("Введите ID клиента (по умолчанию 1): ").strip() or "1"
+                    )
 
-                    if self.current_protocol == 'tcp':
+                    if self.current_protocol == "tcp":
                         self.tcp.connect(self.server_host, self.tcp_port, client_id)
                     else:
                         self.udp.connect(self.server_host, self.udp_port, client_id)

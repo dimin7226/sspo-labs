@@ -1,8 +1,3 @@
-lab01/__pycache__/*
-lab01/*.txt
-lab02/Downloads/*
-lab02/__pycache__/*
-lab02/cinema.log
-lab02/uploads/cinema.log
-lab02/uploads/file.txt
-
+*/__pycache__/*
+*.txt
+*.log
