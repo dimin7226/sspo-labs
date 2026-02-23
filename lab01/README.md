@@ -65,17 +65,30 @@ $out = new-object byte[] 10485760; [io.file]::WriteAllBytes('testfile.bin', $out
 
 ### 4. Запуск сервера
 
+**Windows:**
 ```bash
 python server.py
 ```
+
+**Linux/Mac:**
+```bash
+python3 server.py
+```
+
 Сервер запустится на порту 12345 (по умолчанию).
 
 ### 5. Запуск клиента
 
 В другом терминале:
 
+**Windows:**
 ```bash
 python client.py
+```
+
+**Linux/Mac:**
+```bash
+python3 client.py
 ```
 
 При запуске клиент запросит:
