@@ -1,8 +1,9 @@
 """
 Модуль для работы с сокетами с учетом особенностей TCP
 """
+
 import socket
-from app_config import BUFFER_SIZE, IS_WINDOWS, SOCKET_TIMEOUT, CMD_TERMINATOR
+from app_config import BUFFER_SIZE, IS_WINDOWS, SOCKET_TIMEOUT
 
 
 def set_keepalive(sock, idle=30, interval=5, count=3):
@@ -21,46 +22,12 @@ def set_keepalive(sock, idle=30, interval=5, count=3):
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, interval)
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, count)
             except:
-                try:
-                    sock.setsockopt(socket.IPPROTO_TCP, 4, idle)
-                    sock.setsockopt(socket.IPPROTO_TCP, 5, interval)
-                    sock.setsockopt(socket.IPPROTO_TCP, 6, count)
-                except:
-                    pass
+                pass
     except Exception as e:
         print(f"Ошибка настройки keepalive: {e}")
 
 
-def recv_exact(sock, num_bytes):
-    """Получение точного количества байт с большим буфером"""
-    if num_bytes <= 0:
-        return b''
-
-    # Для больших файлов используем буфер побольше
-    buffer_size = min(num_bytes, 65536)  # 64 KB максимум
-
-    data = b''
-    while len(data) < num_bytes:
-        try:
-            chunk = sock.recv(min(buffer_size, num_bytes - len(data)))
-            if not chunk:
-                raise ConnectionError("Соединение разорвано при получении данных")
-            data += chunk
-
-            # Динамически увеличиваем буфер если всё хорошо
-            if buffer_size < 65536 and len(data) > buffer_size * 10:
-                buffer_size = min(buffer_size * 2, 65536)
-
-        except socket.timeout:
-            # При таймауте просто продолжаем
-            continue
-        except socket.error as e:
-            raise ConnectionError(f"Ошибка сокета: {e}")
-
-    return data
-
-
-def recv_until(sock, delimiter='\n'):
+def recv_until(sock, delimiter="\n"):
     """
     Получение ТЕКСТОВЫХ данных до разделителя
     Использовать ТОЛЬКО для команд!
@@ -68,7 +35,7 @@ def recv_until(sock, delimiter='\n'):
     if isinstance(delimiter, str):
         delimiter = delimiter.encode()
 
-    data = b''
+    data = b""
     while True:
         try:
             chunk = sock.recv(1)
@@ -77,40 +44,43 @@ def recv_until(sock, delimiter='\n'):
 
             data += chunk
 
-            if data.endswith(delimiter) or data.endswith(b'\r\n'):
+            if data.endswith(delimiter) or data.endswith(b"\r\n"):
                 break
         except socket.timeout:
             continue
+        except BlockingIOError:
+            continue
 
-    # Декодируем ТОЛЬКО в конце, когда точно знаем, что это текст
-    return data.decode('utf-8').strip()
+    return data.decode("utf-8").strip()
 
 
 def recv_exact(sock, num_bytes):
-    """
-    Получение точного количества БАЙТ (для файлов)
-    НИКАКОГО декодирования!
-    """
+    """Получение точного количества байт (для файлов)"""
     if num_bytes <= 0:
-        return b''
+        return b""
 
-    data = b''
+    data = b""
     while len(data) < num_bytes:
         try:
-            chunk = sock.recv(min(num_bytes - len(data), BUFFER_SIZE))
+            # Читаем не больше, чем нужно, и не больше размера буфера
+            to_read = min(num_bytes - len(data), BUFFER_SIZE)
+            chunk = sock.recv(to_read)
             if not chunk:
                 raise ConnectionError("Соединение разорвано")
             data += chunk
         except socket.timeout:
             continue
+        except BlockingIOError:
+            # Если сокет неблокирующий и данных пока нет
+            continue
 
-    return data  # ← возвращаем БАЙТЫ, не строку!
+    return data
 
 
 def send_all(sock, data):
     """Гарантированная отправка всех данных"""
     if isinstance(data, str):
-        data = data.encode('utf-8')
+        data = data.encode("utf-8")
 
     total_sent = 0
     while total_sent < len(data):
@@ -120,6 +90,8 @@ def send_all(sock, data):
                 raise ConnectionError("Соединение разорвано")
             total_sent += sent
         except socket.timeout:
+            continue
+        except BlockingIOError:
             continue
         except socket.error as e:
             raise ConnectionError(f"Ошибка сокета: {e}")

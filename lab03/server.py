@@ -9,41 +9,66 @@ import os
 import shutil
 import select
 from datetime import datetime
-from unittest import result
-
-from pynvim import command
 
 from app_config import *
-from socket_handler import set_keepalive, recv_until, recv_exact, send_all
+from socket_handler import recv_until, recv_exact, send_all
 from file_handler import (
     ensure_dirs,
     get_file_size,
-    save_partial_file,
-    finalize_file,
-    get_partial_size,
     FileTransferStats,
-    cleanup_partial,
 )
-from keepalive import ConnectionMonitor
 from udp_handler import *
-from sliding_window import SlidingWindow, ReceiveWindow
+from sliding_window import ReceiveWindow
+
+
+class ClientState:
+    """Класс для хранения состояния TCP клиента отдельно от сокета"""
+
+    def __init__(self, addr):
+        self.addr = addr
+        self.buffer = b""
+        self.client_id = None  # Логическое имя клиента
+        self.upload_state = None
+        self.download_state = None
+
+    @property
+    def display_id(self):
+        """Возвращает ID или адрес для логов"""
+        if self.client_id:
+            return self.client_id
+        return f"{self.addr[0]}:{self.addr[1]}"
 
 
 class TCPServerHandler:
-    """Обработчик TCP подключений (полностью из оригинального server.py)"""
+    """Обработчик TCP подключений"""
 
     def __init__(self, server):
         self.server = server
 
-    def process_command(self, client_sock, client_addr, command):
+    def process_command(self, client_sock, state, command):
         """Обработка одной TCP команды"""
 
-        client_id = f"{client_addr[0]}:{client_addr[1]}"
-
         try:
-            print(f"Команда от {client_id}: {command}")
+            print(f"Команда от {state.display_id}: {command}")
 
-            if command == "CLOSE":
+            # --- HANDSHAKE (Регистрация клиента) ---
+            if command.startswith("CLIENT "):
+                requested_id = command.split(" ", 1)[1].strip()
+
+                # Проверка на уникальность ID
+                if requested_id in self.server.connected_ids:
+                    print(f"Попытка входа с дублирующимся ID: {requested_id}")
+                    send_all(client_sock, "ERROR: ID already taken\n")
+                    return True  # Закрываем соединение
+
+                # Регистрация успешна
+                self.server.connected_ids.add(requested_id)
+                state.client_id = requested_id
+                print(f"Клиент зарегистрирован: {requested_id}")
+                send_all(client_sock, "OK\n")
+                return False
+
+            elif command == "CLOSE":
                 send_all(client_sock, "Соединение закрывается\n")
                 return True  # сигнал на закрытие
 
@@ -62,25 +87,28 @@ class TCPServerHandler:
                 if len(parts) == 3:
                     filename = parts[1]
                     filesize = int(parts[2])
-                    self._handle_upload_nonblocking(client_sock, filename, filesize)
+                    self._handle_upload_nonblocking(state, filename, filesize)
                 else:
                     send_all(client_sock, "ERROR: Неверный формат UPLOAD\n")
 
             elif command.startswith("DOWNLOAD "):
                 filename = command[9:]
-                self._handle_download_nonblocking(client_sock, filename)
+                self._handle_download_nonblocking(client_sock, state, filename)
 
             else:
                 send_all(client_sock, "Неизвестная команда\n")
 
         except Exception as e:
-            send_all(client_sock, f"ERROR: {e}\n")
+            print(f"Error processing command: {e}")
+            try:
+                send_all(client_sock, f"ERROR: {e}\n")
+            except:
+                pass
 
         return False
 
-    def _handle_download_nonblocking(self, client_sock, filename):
+    def _handle_download_nonblocking(self, client_sock, state, filename):
         """Инициализация неблокирующего скачивания файла"""
-
         filename = filename.strip()
         filepath = os.path.join(UPLOADS_DIR, filename)
 
@@ -92,6 +120,7 @@ class TCPServerHandler:
         send_all(client_sock, f"FILESIZE {filesize}\n")
 
         try:
+            # Для простоты в ЛР читаем offset блокирующе (можно улучшить)
             offset_str = recv_until(client_sock)
             offset = int(offset_str) if offset_str.isdigit() else 0
         except Exception:
@@ -102,158 +131,35 @@ class TCPServerHandler:
             if offset > 0:
                 f.seek(offset)
 
-            client_sock.download_state = {
+            state.download_state = {
                 "file": f,
                 "filesize": filesize,
                 "offset": offset,
                 "sent": offset,
                 "filename": filename,
             }
-
             print(f"Начато неблокирующее скачивание {filename}")
 
         except Exception as e:
             send_all(client_sock, f"ERROR: {e}\n")
 
-    def _handle_upload_nonblocking(self, client_sock, filename, filesize):
+    def _handle_upload_nonblocking(self, state, filename, filesize):
         """Инициализация неблокирующей загрузки"""
-
         filepath = os.path.join(UPLOADS_DIR, filename)
 
-        client_sock.upload_state = {
+        # Если файл существует, добавляем таймстемп
+        if os.path.exists(filepath):
+            base, ext = os.path.splitext(filename)
+            filepath = os.path.join(UPLOADS_DIR, f"{base}_{int(time.time())}{ext}")
+
+        state.upload_state = {
             "filename": filename,
             "filepath": filepath,
             "filesize": filesize,
             "received": 0,
             "file": open(filepath, "wb"),
         }
-
         print(f"Начата неблокирующая загрузка {filename} ({filesize} байт)")
-
-    def _handle_upload(self, client_sock, client_id, filename, filesize):
-        """Обработка загрузки файла (оригинальный код)"""
-        print(
-            f"Начало загрузки файла {filename} размером {filesize} байт от клиента {client_id}"
-        )
-
-        stats = FileTransferStats()
-        stats.start()
-
-        safe_client = "".join(c for c in client_id if c.isalnum() or c in "._-")
-        safe_filename = "".join(c for c in filename if c.isalnum() or c in "._-")
-        partial_path = os.path.join(PARTIAL_DIR, f"{safe_client}_{safe_filename}.part")
-        final_path = os.path.join(UPLOADS_DIR, filename)
-
-        try:
-            if os.path.exists(final_path):
-                base, ext = os.path.splitext(filename)
-                final_path = os.path.join(
-                    UPLOADS_DIR, f"{base}_{int(time.time())}{ext}"
-                )
-                print(
-                    f"Файл уже существует, сохраняем как: {os.path.basename(final_path)}"
-                )
-
-            with open(partial_path, "wb") as f:
-                received = 0
-                while received < filesize:
-                    chunk_size = min(BUFFER_SIZE, filesize - received)
-                    data = recv_exact(client_sock, chunk_size)
-                    f.write(data)
-                    received += len(data)
-                    stats.add_bytes(len(data))
-                    percent = (received / filesize) * 100
-                    print(f"\rЗагрузка {filename}: {percent:.1f}%", end="")
-
-            print()
-            shutil.move(partial_path, final_path)
-            stats.stop()
-            stats.print_stats("Загрузка файла")
-            response = f"Файл {os.path.basename(final_path)} успешно загружен\n"
-            send_all(client_sock, response)
-
-        except Exception as e:
-            print(f"\nОшибка при загрузке: {e}")
-            if os.path.exists(partial_path):
-                os.remove(partial_path)
-            send_all(client_sock, f"ERROR: {e}\n")
-
-    def _handle_download(self, client_sock, filename):
-        """Обработка скачивания файла (оригинальный код)"""
-        # Очищаем filename от возможных пробелов и символов
-        filename = filename.strip()
-
-        # Проверяем несколько возможных путей
-        possible_paths = [
-            os.path.join(UPLOADS_DIR, filename),  # uploads/filename
-            os.path.join(os.getcwd(), UPLOADS_DIR, filename),  # полный путь
-            filename,  # прямой путь
-            os.path.join(UPLOADS_DIR, os.path.basename(filename)),  # только имя
-        ]
-
-        filepath = None
-        for path in possible_paths:
-            print(f"Проверка пути: {path}")
-            if os.path.exists(path):
-                filepath = path
-                print(f"Файл найден: {path}")
-                break
-
-        if not filepath:
-            print(f"Файл не найден. Проверенные пути: {possible_paths}")
-            print(f"Содержимое папки {UPLOADS_DIR}:")
-            try:
-                files = os.listdir(UPLOADS_DIR)
-                for f in files:
-                    print(f"  - {f}")
-            except Exception as e:
-                print(f"Ошибка чтения папки: {e}")
-
-            send_all(client_sock, "ERROR: Файл не найден\n")
-            return
-
-        filesize = get_file_size(filepath)
-        print(f"Размер файла: {filesize} байт")
-        send_all(client_sock, f"FILESIZE {filesize}\n")
-
-        try:
-            offset_str = recv_until(client_sock)
-            print(f"Получен offset: {offset_str}")
-            offset = int(offset_str) if offset_str.isdigit() else 0
-            if offset > 0:
-                print(f"Докачка файла {filename} с позиции {offset}")
-        except Exception as e:
-            print(f"Ошибка при получении offset: {e}")
-            offset = 0
-
-        stats = FileTransferStats()
-        stats.start()
-
-        try:
-            with open(filepath, "rb") as f:
-                if offset > 0:
-                    f.seek(offset)
-                remaining = filesize - offset
-                sent = 0
-
-                while remaining > 0:
-                    chunk_size = min(BUFFER_SIZE, remaining)
-                    data = f.read(chunk_size)
-                    if not data:
-                        break
-                    send_all(client_sock, data)
-                    sent += len(data)
-                    remaining -= len(data)
-                    stats.add_bytes(len(data))
-                    percent = ((offset + sent) / filesize) * 100
-                    print(f"\rСкачивание {filename}: {percent:.1f}%", end="")
-
-            print()
-            stats.stop()
-            stats.print_stats("Скачивание файла")
-
-        except Exception as e:
-            print(f"\nОшибка при скачивании: {e}")
 
 
 class UDPServerHandler:
@@ -262,7 +168,6 @@ class UDPServerHandler:
     def __init__(self, server):
         self.server = server
         self.clients = {}  # addr -> session_data
-        self.client_sessions = {}
 
     def handle_packet(self, data, client_addr):
         """Обработка UDP пакета"""
@@ -307,7 +212,6 @@ class UDPServerHandler:
                 }
                 print(f"UDP клиент {client_id} подключился с адреса {client_addr}")
 
-                # Отправляем подтверждение
                 packet = create_packet(0, 1, FLAG_ACK | FLAG_END, b"OK")
                 self.server.udp_socket.sendto(packet, client_addr)
 
@@ -326,7 +230,6 @@ class UDPServerHandler:
                     del self.clients[client_addr]
                     print(f"UDP клиент {client_id} отключился")
             else:
-                # Это может быть команда
                 self._handle_command(client_addr, self.clients.get(client_addr), data)
 
         except Exception as e:
@@ -335,8 +238,6 @@ class UDPServerHandler:
     def _handle_data(self, client_addr, packet_id, total_packets, flags, payload):
         """Обработка данных"""
         if client_addr not in self.clients:
-            print(f"UDP данные от неизвестного клиента {client_addr}")
-            # Создаем временную сессию
             self.clients[client_addr] = {
                 "client_id": "unknown",
                 "connected": True,
@@ -347,12 +248,11 @@ class UDPServerHandler:
 
         client_info = self.clients[client_addr]
 
-        # Определяем тип данных по packet_id
-        if packet_id == 0:  # Команда
+        if packet_id == 0:
             self._handle_command(
                 client_addr, client_info, payload.decode("utf-8", errors="ignore")
             )
-        else:  # Данные файла
+        else:
             self._handle_file_data(
                 client_addr, client_info, packet_id, total_packets, flags, payload
             )
@@ -425,12 +325,10 @@ class UDPServerHandler:
         filename = session["filename"]
         filepath = os.path.join(UPLOADS_DIR, filename)
 
-        # Проверяем, не существует ли уже файл
         if os.path.exists(filepath):
             base, ext = os.path.splitext(filename)
             filepath = os.path.join(UPLOADS_DIR, f"{base}_udp{ext}")
 
-        # Собираем пакеты в правильном порядке
         with open(filepath, "wb") as f:
             for packet_id in sorted(session["packets"].keys()):
                 f.write(session["packets"][packet_id])
@@ -439,43 +337,15 @@ class UDPServerHandler:
         bitrate = (session["filesize"] * 8) / duration if duration > 0 else 0
 
         print(f"\n✓ UDP файл {os.path.basename(filepath)} загружен")
-        print(f"  Размер: {session['filesize']} байт")
-        print(f"  Скорость: {bitrate / 1000:.2f} Кбит/с")
-
         self._send_response(client_addr, f"UPLOAD_OK {os.path.basename(filepath)}")
         client_info["file_session"] = {}
 
     def _handle_download(self, client_addr, filename):
         """Обработка UDP скачивания"""
-        # Очищаем filename
         filename = filename.strip()
+        filepath = os.path.join(UPLOADS_DIR, filename)
 
-        # Проверяем несколько возможных путей
-        possible_paths = [
-            os.path.join(UPLOADS_DIR, filename),
-            os.path.join(os.getcwd(), UPLOADS_DIR, filename),
-            filename,
-            os.path.join(UPLOADS_DIR, os.path.basename(filename)),
-        ]
-
-        filepath = None
-        for path in possible_paths:
-            print(f"UDP проверка пути: {path}")
-            if os.path.exists(path):
-                filepath = path
-                print(f"UDP файл найден: {path}")
-                break
-
-        if not filepath:
-            print(f"UDP файл не найден. Проверенные пути: {possible_paths}")
-            print(f"Содержимое папки {UPLOADS_DIR}:")
-            try:
-                files = os.listdir(UPLOADS_DIR)
-                for f in files:
-                    print(f"  - {f}")
-            except Exception as e:
-                print(f"Ошибка чтения папки: {e}")
-
+        if not os.path.exists(filepath):
             self._send_response(client_addr, "ERROR: Файл не найден")
             return
 
@@ -483,10 +353,8 @@ class UDPServerHandler:
         print(f"UDP размер файла: {filesize} байт")
         self._send_response(client_addr, f"FILESIZE {filesize}")
 
-        # Небольшая пауза для обработки
         time.sleep(0.2)
 
-        # Отправляем файл
         try:
             with open(filepath, "rb") as f:
                 packet_seq = 1000
@@ -507,16 +375,10 @@ class UDPServerHandler:
 
                     packet = create_packet(packet_seq, total_packets, flags, chunk)
                     self.server.udp_socket.sendto(packet, client_addr)
-
                     packet_seq += 1
-                    percent = (sent / filesize) * 100
-                    print(f"\rUDP отправка {filename}: {percent:.1f}%", end="")
-
-                    # Небольшая задержка для предотвращения переполнения
                     time.sleep(0.002)
 
             print(f"\nUDP файл {filename} отправлен")
-
         except Exception as e:
             print(f"Ошибка при UDP отправке: {e}")
 
@@ -524,9 +386,6 @@ class UDPServerHandler:
         """Отправка UDP ответа"""
         try:
             data = response_text.encode("utf-8")
-            print(f"Отправка UDP ответа {client_addr}: {response_text}")
-
-            # Разбиваем на пакеты если нужно
             max_chunk = 1400 - PACKET_HEADER_SIZE
             total_packets = (len(data) + max_chunk - 1) // max_chunk
 
@@ -534,17 +393,12 @@ class UDPServerHandler:
                 start = i * max_chunk
                 end = min(start + max_chunk, len(data))
                 chunk = data[start:end]
-
                 flags = FLAG_DATA
                 if i == total_packets - 1:
                     flags |= FLAG_END
-
                 packet = create_packet(i, total_packets, flags, chunk)
                 self.server.udp_socket.sendto(packet, client_addr)
-
-                # Небольшая задержка
                 time.sleep(0.001)
-
         except Exception as e:
             print(f"Ошибка отправки UDP ответа: {e}")
 
@@ -568,7 +422,8 @@ class Server:
         self.tcp_socket = None
         self.udp_socket = None
 
-        # Инициализация обработчиков
+        self.connected_ids = set()
+
         self.tcp_handler = TCPServerHandler(self)
         self.udp_handler = UDPServerHandler(self)
 
@@ -576,7 +431,6 @@ class Server:
 
     def start(self):
         """Запуск сервера (ЛР №3 — мультиплексирование через select)"""
-
         self.running = True
 
         # --- TCP ---
@@ -594,34 +448,46 @@ class Server:
         print(f"TCP сервер: {self.tcp_host}:{self.tcp_port}")
         print(f"UDP сервер: {self.udp_host}:{self.udp_port}")
 
-        # monitored sockets
         inputs = [self.tcp_socket, self.udp_socket]
-        tcp_clients = {}  # sock -> client_addr
+
+        # ВАЖНО: Используем ClientState вместо прямых атрибутов сокета
+        # Ключ: объект сокета, Значение: объект ClientState
+        tcp_clients = {}
 
         try:
             while self.running:
+                # Select слушает сокеты на чтение
+                readable, _, exceptional = select.select(inputs, [], inputs, 0.1)
 
-                readable, _, exceptional = select.select(inputs, [], inputs, 1)
+                # Проталкиваем данные скачивания
+                self.check_downloads(inputs, tcp_clients)
 
                 for sock in readable:
-
                     # --- новое TCP подключение ---
                     if sock is self.tcp_socket:
                         client_sock, client_addr = self.tcp_socket.accept()
                         client_sock.setblocking(False)
+
+                        # Создаем состояние для этого клиента
+                        state = ClientState(client_addr)
+                        tcp_clients[client_sock] = state
+
                         inputs.append(client_sock)
-                        tcp_clients[client_sock] = client_addr
                         print(f"Новое TCP подключение: {client_addr}")
 
                     # --- UDP пакет ---
                     elif sock is self.udp_socket:
-                        data, addr = self.udp_socket.recvfrom(65535)
-                        self.udp_handler.handle_packet(data, addr)
+                        try:
+                            data, addr = self.udp_socket.recvfrom(65535)
+                            self.udp_handler.handle_packet(data, addr)
+                        except Exception as e:
+                            print(f"UDP Error: {e}")
 
                     # --- данные TCP клиента ---
                     else:
-                        if not self._handle_tcp_event(sock, tcp_clients, inputs):
-                            continue
+                        if sock in tcp_clients:
+                            if not self._handle_tcp_event(sock, tcp_clients, inputs):
+                                continue
 
                 # --- обработка ошибок ---
                 for sock in exceptional:
@@ -629,93 +495,124 @@ class Server:
 
         except KeyboardInterrupt:
             print("\nОстановка сервера...")
-
         finally:
             self.stop()
 
     def _handle_tcp_event(self, sock, tcp_clients, inputs):
         """Обработка события TCP клиента (однопоточно)"""
+        state = tcp_clients[sock]  # Получаем состояние клиента
 
         try:
-            data = sock.recv(BUFFER_SIZE)
+            try:
+                data = sock.recv(BUFFER_SIZE)
+            except BlockingIOError:
+                return True
 
             if not data:
                 self._close_tcp_client(sock, tcp_clients, inputs)
                 return False
 
-            # Если идёт загрузка файла — принимаем бинарные данные
-            if hasattr(sock, "upload_state"):
-                state = sock.upload_state
-                remaining = state["filesize"] - state["received"]
+            # --- UPLOAD MODE ---
+            if state.upload_state:
+                upload = state.upload_state
+                remaining = upload["filesize"] - upload["received"]
 
                 chunk = data[:remaining]
-                state["file"].write(chunk)
-                state["received"] += len(chunk)
+                upload["file"].write(chunk)
+                upload["received"] += len(chunk)
 
-                if state["received"] >= state["filesize"]:
-                    state["file"].close()
-                    send_all(sock, f"Файл {state['filename']} успешно загружен\n")
-                    print(f"\nUPLOAD завершён: {state['filename']}")
-                    del sock.upload_state
-
-                # если в data были лишние байты — возвращаем в буфер
                 extra = data[len(chunk) :]
                 if extra:
-                    if not hasattr(sock, "buffer"):
-                        sock.buffer = b""
-                    sock.buffer += extra
+                    state.buffer += extra
+
+                if upload["received"] >= upload["filesize"]:
+                    upload["file"].close()
+                    send_all(sock, f"Файл {upload['filename']} успешно загружен\n")
+                    print(f"\nUPLOAD завершён: {upload['filename']}")
+                    state.upload_state = None
 
                 return True
 
-            # --- неблокирующее скачивание ---
-            if hasattr(sock, "download_state"):
-                state = sock.download_state
-                remaining = state["filesize"] - state["sent"]
+            # --- DOWNLOAD MODE ---
+            # При скачивании клиент может прислать CLOSE или другие команды,
+            # но пока просто буферизуем их.
 
-                if remaining > 0:
-                    chunk_size = min(BUFFER_SIZE, remaining)
-                    data = state["file"].read(chunk_size)
+            # --- COMMAND MODE ---
+            state.buffer += data
 
-                    if data:
-                        send_all(sock, data)
-                        state["sent"] += len(data)
-                else:
-                    state["file"].close()
-                    print(f"DOWNLOAD завершён: {state['filename']}")
-                    del sock.download_state
+            while b"\n" in state.buffer:
+                line, state.buffer = state.buffer.split(b"\n", 1)
+                try:
+                    command = line.decode("utf-8").strip()
+                    if not command:
+                        continue
 
-                return True
+                    should_close = self.tcp_handler.process_command(
+                        sock, state, command
+                    )
 
-            # обычная буферизация команд
-            if not hasattr(sock, "buffer"):
-                sock.buffer = b""
-
-            sock.buffer += data
-
-            while b"\n" in sock.buffer:
-                line, sock.buffer = sock.buffer.split(b"\n", 1)
-                command = line.decode("utf-8").strip()
-
-                should_close = self.tcp_handler.process_command(
-                    sock, tcp_clients[sock], command
-                )
-
-                if should_close:
-                    self._close_tcp_client(sock, tcp_clients, inputs)
-                    return False
+                    if should_close:
+                        self._close_tcp_client(sock, tcp_clients, inputs)
+                        return False
+                except UnicodeDecodeError:
+                    print("Error decoding command")
 
             return True
 
-        except Exception:
+        except Exception as e:
+            print(f"TCP socket error: {e}")
             self._close_tcp_client(sock, tcp_clients, inputs)
             return False
 
+    def check_downloads(self, inputs, tcp_clients):
+        """Метод для проталкивания данных скачивания"""
+        for sock in inputs:
+            if sock in tcp_clients:
+                state = tcp_clients[sock]
+                if state.download_state:
+                    try:
+                        dl = state.download_state
+                        remaining = dl["filesize"] - dl["sent"]
+                        if remaining > 0:
+                            chunk_size = min(BUFFER_SIZE, remaining)
+                            data = dl["file"].read(chunk_size)
+                            if data:
+                                try:
+                                    sock.send(data)
+                                    dl["sent"] += len(data)
+                                except BlockingIOError:
+                                    # Откатываем позицию файла, если не удалось отправить
+                                    dl["file"].seek(-len(data), 1)
+                        else:
+                            dl["file"].close()
+                            print(f"DOWNLOAD завершён: {dl['filename']}")
+                            state.download_state = None
+                    except (BlockingIOError, socket.error):
+                        pass
+
     def _close_tcp_client(self, sock, tcp_clients, inputs):
         """Корректное закрытие TCP клиента"""
+        state = tcp_clients.get(sock)
 
-        addr = tcp_clients.get(sock)
-        if addr:
-            print(f"TCP клиент отключился: {addr}")
+        if state and state.client_id:
+            if state.client_id in self.connected_ids:
+                self.connected_ids.remove(state.client_id)
+                print(f"Освобожден ID: {state.client_id}")
+
+        if state:
+            print(f"TCP клиент отключился: {state.addr}")
+
+            # Закрываем файлы
+            if state.upload_state:
+                try:
+                    state.upload_state["file"].close()
+                except:
+                    pass
+            if state.download_state:
+                try:
+                    state.download_state["file"].close()
+                except:
+                    pass
 
         if sock in inputs:
             inputs.remove(sock)
@@ -728,63 +625,12 @@ class Server:
         except:
             pass
 
-    def _run_tcp_server(self):
-        """Запуск TCP сервера (оригинальный код)"""
-        self.tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.tcp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.tcp_socket.bind((self.tcp_host, self.tcp_port))
-        self.tcp_socket.listen(5)
-
-        print(f"TCP сервер слушает порт {self.tcp_port}")
-
-        while self.running:
-            try:
-                client_sock, client_addr = self.tcp_socket.accept()
-                print(f"\nНовое TCP подключение от {client_addr}")
-
-                client_thread = threading.Thread(
-                    target=self.tcp_handler.handle_client,
-                    args=(client_sock, client_addr),
-                )
-                client_thread.daemon = True
-                client_thread.start()
-            except Exception as e:
-                if self.running:
-                    print(f"Ошибка TCP сервера: {e}")
-
-    def _run_udp_server(self):
-        """Запуск UDP сервера"""
-        self.udp_socket = create_udp_socket()
-        self.udp_socket.bind((self.udp_host, self.udp_port))
-        self.udp_socket.settimeout(1.0)
-
-        print(f"UDP сервер слушает порт {self.udp_port}")
-
-        while self.running:
-            try:
-                data, client_addr = self.udp_socket.recvfrom(65535)
-                # Обрабатываем в отдельном потоке
-                thread = threading.Thread(
-                    target=self.udp_handler.handle_packet, args=(data, client_addr)
-                )
-                thread.daemon = True
-                thread.start()
-            except socket.timeout:
-                continue
-            except Exception as e:
-                if self.running:
-                    print(f"Ошибка UDP сервера: {e}")
-
     def stop(self):
         self.running = False
-
         if self.tcp_socket:
             self.tcp_socket.close()
-
         if self.udp_socket:
             self.udp_socket.close()
-
-        print("Сервер остановлен")
 
 
 def main():
