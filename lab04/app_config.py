@@ -23,7 +23,7 @@ PARTIAL_DIR = "partial"
 MAX_RECOVERY_TIME = 600
 
 # Определение ОС
-IS_WINDOWS = platform.system() == "Linux"
+IS_WINDOWS = platform.system() == "Windows"
 
 # Таймауты (в секундах)
 SOCKET_TIMEOUT = 300
@@ -47,9 +47,6 @@ RESPONSE_OK = "OK"
 RESPONSE_ERROR = "ERROR"
 RESPONSE_RESUME = "RESUME"
 RESPONSE_FILESIZE = "FILESIZE"
-
-# Максимальный идентификатор запроса для пользовательских UDP сессий
-REQUEST_ID_MAX = 0xFFFF
 
 # Настройки отображения
 SHOW_PROGRESS_BAR = True
