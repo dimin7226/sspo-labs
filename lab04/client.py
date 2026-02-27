@@ -8,6 +8,7 @@ import time
 import signal
 import sys
 import threading
+import queue
 
 from app_config import *
 from socket_handler import set_keepalive, recv_until, recv_exact, send_all
@@ -224,6 +225,11 @@ class UDPClientHandler:
         self.packet_timeout = 0.1
         # для генерации request_id (не равного 0)
         self.next_request_id = 1
+        # очередь пакетов, работающая в отдельном потоке
+        self.packet_queue = queue.Queue()
+        self.packet_thread = None
+        self.packet_handlers = {}  # request_id -> queue.Queue
+        self.packet_lock = threading.Lock()
 
     def _get_request_id(self):
         """Вернуть уникальный request_id в диапазоне [1, REQUEST_ID_MAX]."""
@@ -233,6 +239,45 @@ class UDPClientHandler:
             self.next_request_id = 1
         return rid
 
+    def _start_packet_reader(self):
+        """Запустить поток чтения пакетов из сокета."""
+        if self.packet_thread and self.packet_thread.is_alive():
+            return
+        self.packet_thread = threading.Thread(target=self._packet_reader_loop)
+        self.packet_thread.daemon = True
+        self.packet_thread.start()
+
+    def _packet_reader_loop(self):
+        """Цикл чтения пакетов из сокета и распределения по request_id."""
+        while self.connected:
+            try:
+                data, addr = self.socket.recvfrom(65535)
+                result = parse_packet(data)
+                if not result:
+                    continue
+                rid, packet_id, total, flags, payload = result
+                with self.packet_lock:
+                    if rid not in self.packet_handlers:
+                        self.packet_handlers[rid] = queue.Queue()
+                    handler_queue = self.packet_handlers[rid]
+                handler_queue.put((packet_id, total, flags, payload))
+            except Exception:
+                if self.connected:
+                    pass
+
+    def _get_response_queue(self, request_id):
+        """Получить очередь для данного request_id."""
+        with self.packet_lock:
+            if request_id not in self.packet_handlers:
+                self.packet_handlers[request_id] = queue.Queue()
+            return self.packet_handlers[request_id]
+
+    def _cleanup_response_queue(self, request_id):
+        """Очистить очередь после завершения работы."""
+        with self.packet_lock:
+            if request_id in self.packet_handlers:
+                del self.packet_handlers[request_id]
+
     def connect(self, server_host, server_port, client_id):
         """Подключение к UDP серверу"""
         try:
@@ -240,6 +285,7 @@ class UDPClientHandler:
             self.socket.settimeout(1)
             self.server_addr = (server_host, server_port)
             self.client_id = client_id
+            self._start_packet_reader()
 
             print(f"UDP подключение к {server_host}:{server_port}...")
 
@@ -257,6 +303,8 @@ class UDPClientHandler:
                         resp_rid, packet_id, total, flags, payload = result
                         if resp_rid == rid and (flags & FLAG_ACK) and payload == b"OK":
                             self.connected = True
+                            # после успешного установления связи запускаем считыватель пакетов
+                            self._start_packet_reader()
                             print(f"✓ Подключено к UDP серверу {server_host}:{server_port}")
                             return True
                 except socket.timeout:
@@ -424,6 +472,7 @@ class UDPClientHandler:
         base_seq = 1000
         sent_bytes = 0
         last_update = time.time()
+        handler_queue = self._get_response_queue(request_id)
 
         with open(filename, "rb") as f:
             print("Отправка данных...")
@@ -452,18 +501,13 @@ class UDPClientHandler:
 
                 try:
                     while True:
-                        data, addr = self.socket.recvfrom(65535)
-                        result = parse_packet(data)
-                        if result:
-                            rid, ack_id, _, flags, _ = result
-                            if rid != request_id:
-                                continue
-                            if flags & FLAG_ACK:
-                                if ack_id in window:
-                                    del window[ack_id]
-                                    if ack_id >= base_seq:
-                                        base_seq = ack_id + 1
-                except socket.timeout:
+                        packet_id, total, flags, _ = handler_queue.get(timeout=0.001)
+                        if flags & FLAG_ACK:
+                            if packet_id in window:
+                                del window[packet_id]
+                                if packet_id >= base_seq:
+                                    base_seq = packet_id + 1
+                except queue.Empty:
                     pass
 
                 current_time = time.time()
@@ -493,6 +537,7 @@ class UDPClientHandler:
 
         print()
         self.stats.stop()
+        self._cleanup_response_queue(request_id)
         self._print_stats("UDP загрузка файла")
 
     def _receive_file_fast(self, filepath, filesize, request_id):
@@ -507,28 +552,21 @@ class UDPClientHandler:
         # Увеличиваем буферы до максимума
         self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 * 1024 * 1024)
         self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 8 * 1024 * 1024)
-        self.socket.settimeout(0.001)  # Минимальный таймаут
 
         print("Прием данных на максимальной скорости...")
 
         last_progress = time.time()
         last_ack = time.time()
         ack_batch = []
+        handler_queue = self._get_response_queue(request_id)
 
         while received < filesize:
             try:
                 # Принимаем все доступные пакеты
                 while True:
                     try:
-                        data, addr = self.socket.recvfrom(65535)
-                        result = parse_packet(data)
-                        if not result:
-                            continue
-
-                        rid, packet_id, total, flags, payload = result
-                        if rid != request_id:
-                            continue
-
+                        packet_id, total, flags, payload = handler_queue.get(timeout=0.001)
+                        
                         if not (flags & FLAG_DATA):
                             continue
 
@@ -539,7 +577,7 @@ class UDPClientHandler:
                             self.stats.add_bytes(len(payload) + PACKET_HEADER_SIZE)
                             ack_batch.append(packet_id)
 
-                    except socket.timeout:
+                    except queue.Empty:
                         break
 
                 # Отправляем ACK пачкой
@@ -591,6 +629,7 @@ class UDPClientHandler:
             print("✗ Не получено данных")
 
         self.stats.stop()
+        self._cleanup_response_queue(request_id)
         self._print_stats("UDP скачивание файла")
 
         # Сравнение с TCP
@@ -600,37 +639,43 @@ class UDPClientHandler:
             print(f"✓ UDP быстрее TCP в {ratio:.2f} раз")
 
     def _wait_for_response(self, timeout=3, request_id=0):
-        """Ожидание ответа от сервера, только для указанного request_id."""
-        start_time = time.time()
+        """Ожидание ответа от сервера, читаем из очереди для request_id."""
+        if not request_id:
+            return None
+
+        handler_queue = self._get_response_queue(request_id)
         data = b""
         packets = {}
+        start_time = time.time()
 
         while time.time() - start_time < timeout:
             try:
-                packet, addr = self.socket.recvfrom(65535)
-                result = parse_packet(packet)
-                if not result:
-                    continue
-
-                rid, packet_id, total, flags, payload = result
-                if request_id and rid != request_id:
-                    # чужой запрос, игнорируем
-                    continue
-
+                remaining_time = timeout - (time.time() - start_time)
+                if remaining_time <= 0:
+                    break
+                
+                packet_id, total, flags, payload = handler_queue.get(timeout=remaining_time)
+                
                 if flags & FLAG_DATA:
                     packets[packet_id] = payload
-                    ack = create_ack_packet(rid, packet_id)
+                    ack = create_ack_packet(request_id, packet_id)
                     self.socket.sendto(ack, self.server_addr)
 
                 if flags & FLAG_END:
                     for i in range(total):
                         if i in packets:
                             data += packets[i]
+                    self._cleanup_response_queue(request_id)
                     return data.decode("utf-8", errors="ignore")
 
-            except socket.timeout:
+            except queue.Empty:
                 continue
+            except Exception as e:
+                print(f"Ошибка при ожидании ответа: {e}")
+                self._cleanup_response_queue(request_id)
+                return None
 
+        self._cleanup_response_queue(request_id)
         return None
 
     def _save_file(self, filepath, packets, expected_size):
