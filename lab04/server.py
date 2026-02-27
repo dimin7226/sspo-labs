@@ -665,6 +665,19 @@ class Server:
                         queue = Queue()
                         self.udp_handler.sessions[client_addr] = queue
 
+                    request_id = "unknown"
+                    try:
+                        # Пытаемся получить request_id из данных
+                        payload_str = payload.decode("utf-8", errors="ignore")
+                        if payload_str.startswith("CLIENT "):
+                            request_id = payload_str[7:].strip()
+                    except:
+                        pass
+
+                    # ВЫВОД СООБЩЕНИЯ О СОЗДАНИИ ПОТОКА ЗДЕСЬ
+                    print(
+                        f"+++ Новый поток для request_id={request_id} создан (UDP сессия)"
+                    )
                     thread = threading.Thread(
                         target=self.udp_handler.handle_session,
                         args=(client_addr, data),
@@ -685,7 +698,6 @@ class Server:
             except Exception as e:
                 if self.running:
                     print(f"Ошибка UDP сервера: {e}")
-
 
     def stop(self):
         """Остановка сервера"""
